@@ -80,7 +80,9 @@ class targeting_radar:
             classification = "HIGH_ALT"
         else:
             classification = "UNKNOWN"
-            
+
+        logger.info(f"[SSTR-018] v_mag={v_mag:.1f} m/s, alt={abs(z):.1f} m -> {classification}")
+
         return {
             'position': (float(x), float(y), float(z)),
             'velocity': (float(vx), float(vy), float(vz)),
