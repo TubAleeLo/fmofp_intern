@@ -278,6 +278,7 @@ class aewc_radar:
             # Stealth target history cleanup is missing - this causes the memory leak
             
             del self.current_targets[track_id]
+            logger.info(f"[SSTR-016] removed track {track_id}; track_histories still holding: {len(self.track_histories)} (stealth={target.get('is_stealth', False)})")
             return True
         return False
 
