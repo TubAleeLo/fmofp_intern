@@ -1110,6 +1110,8 @@ class MessageQueueManager:
             
             # Sort queue using priority comparison
             sorted_queue = sorted(queue_list, key=priority_comparator, reverse=True)
+
+            logger.info(f"[SSTR-017] dispatch order (priorities): {[self._get_message_priority_value(m) for m in sorted_queue]}")
             
             # Clear and repopulate queue
             queue.clear()
