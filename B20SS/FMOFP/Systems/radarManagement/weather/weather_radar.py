@@ -1104,6 +1104,7 @@ class weather_radar:
         elevation_angles = self.config['vcp'][self.mode.name.lower()]['elevs']
         if hasattr(ref, 'astype'):
             ref = ref.astype(np.float32)
+            logger.info(f"[SSTR-020] VIL input dtype after cast: {ref.dtype} (expected float64)")
         return self.vil_data_generator.calculate_vil(ref, elevation_angles)
 
     def _detect_wind_shear(self, vel, width):
