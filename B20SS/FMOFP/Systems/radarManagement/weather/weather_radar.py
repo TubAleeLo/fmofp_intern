@@ -260,6 +260,7 @@ class weather_radar:
             self._resource_usage['cpu_usage'] = 30  
             self._resource_usage['memory_usage'] = 40   
             self._resource_usage['disk_usage'] = 20  
+            logger.info(f"[SSTR-019] resource usage set to cpu={self._resource_usage['cpu_usage']} mem={self._resource_usage['memory_usage']} disk={self._resource_usage['disk_usage']} (hardcoded, ignores actual load)")
         except Exception as e:
             logger.error(f"[WEATHER] Error updating resource usage for {self.name}: {str(e)}")
 
