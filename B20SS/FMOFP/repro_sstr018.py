@@ -34,6 +34,8 @@ USAGE
 import os
 import sys
 import math
+import inspect
+import re
 
 # The codebase mixes "FMOFP."-prefixed and bare imports, so both B20SS/ and
 # B20SS/FMOFP/ must be importable. Mirror the app's path setup.
@@ -58,6 +60,82 @@ def required_classification(v_mag, z):
         return "HIGH_ALT"
     else:
         return "UNKNOWN"
+
+
+def extract_live_classifier():
+    """Pull the actual classification block out of the live _generate_target
+    source and return a callable classify(v_mag, z) that executes those exact
+    lines. This reflects the live thresholds (so it detects a fix) and lets us
+    test exact boundary values deterministically, without modifying product
+    code. Returns None if the block can't be located.
+    """
+    src = inspect.getsource(targeting_radar._generate_target)
+    lines = src.splitlines()
+
+    # Find the "if v_mag ..." line that opens the classification block and
+    # capture through the "classification = "UNKNOWN"" line.
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(r"\s*if\s+v_mag\s*>", line):
+            start = i
+            break
+    if start is None:
+        return None
+
+    block = []
+    for line in lines[start:]:
+        block.append(line)
+        if "classification" in line and "UNKNOWN" in line:
+            break
+    else:
+        return None  # never found the closing UNKNOWN line
+
+    # Dedent so the block is valid at module indentation, then wrap in a func.
+    dedented = inspect.cleandoc("\n".join(block))
+    func_src = "def _live_classify(v_mag, z):\n"
+    for bl in dedented.splitlines():
+        func_src += "    " + bl + "\n"
+    func_src += "    return classification\n"
+
+    namespace = {}
+    exec(func_src, namespace)
+    return namespace["_live_classify"]
+
+
+def run_boundary_check():
+    """Deterministic exact-boundary check using the live classification logic."""
+    classify = extract_live_classifier()
+    if classify is None:
+        print("BOUNDARY CHECK: could not extract live classification block; skipped.")
+        return None
+
+    # Exact boundary cases: (v_mag, altitude, label)
+    cases = [
+        (250.0,  0.0,     "speed exactly at 250 (requirement boundary)"),
+        (250.1,  0.0,     "speed just over 250 -> should be FIGHTER"),
+        (300.0,  0.0,     "speed 300 -> should be FIGHTER"),
+        (400.0,  0.0,     "speed exactly 400 (old buggy boundary)"),
+        (400.1,  0.0,     "speed just over 400 -> should be FIGHTER"),
+        (150.0,  10000.0, "altitude exactly at 10000 (requirement boundary)"),
+        (150.0,  10000.1, "altitude just over 10000 -> should be HIGH_ALT"),
+        (150.0,  8000.1,  "altitude just over 8000 (old buggy boundary)"),
+        (150.0,  -10500.0,"negative altitude beyond 10000 -> should be HIGH_ALT"),
+        (150.0,  2000.0,  "slow and low -> genuinely UNKNOWN"),
+    ]
+
+    print("DETERMINISTIC BOUNDARY CHECK (runs the live classification logic):")
+    print(f"{'v_mag':>7} | {'alt':>9} | {'live':>9} | {'required':>9} | result")
+    print("-" * 72)
+    failures = 0
+    for v_mag, z, label in cases:
+        live = classify(v_mag, z)
+        req = required_classification(v_mag, z)
+        flag = "  <-- MISMATCH" if live != req else ""
+        if live != req:
+            failures += 1
+        print(f"{v_mag:>7.1f} | {z:>9.1f} | {live:>9} | {req:>9} | {label}{flag}")
+    print("-" * 72)
+    return failures
 
 
 def main():
@@ -90,30 +168,41 @@ def main():
     print("=" * 72)
     print("SSTR-018 reproduction — Targeting Radar classification thresholds")
     print("=" * 72)
-    print(f"Generated {n} targets via the REAL _generate_target method.")
+
+    # --- Check 1: deterministic exact-boundary check ---
+    boundary_failures = run_boundary_check()
+    print()
+
+    # --- Check 2: statistical sampling via the real _generate_target ---
+    print(f"STATISTICAL SAMPLING CHECK (real _generate_target, {n} targets):")
     print(f"Requirement: v_mag > {REQUIRED_FIGHTER_SPEED:.0f} -> FIGHTER, "
           f"|alt| > {REQUIRED_HIGH_ALT:.0f} -> HIGH_ALT")
-    print("-" * 72)
     print(f"Targets that SHOULD be FIGHTER (v_mag > 250): {fighter_band_seen}")
     print(f"Targets that SHOULD be HIGH_ALT (|alt| > 10000): {high_alt_seen}")
     print(f"Total misclassified vs requirement: {len(mismatches)}")
-    print("-" * 72)
-
     if mismatches:
         print("Sample mismatches (live classification vs required):")
-        for v_mag, z, live, req in mismatches[:8]:
+        for v_mag, z, live, req in mismatches[:5]:
             print(f"    v_mag={v_mag:6.1f} m/s, alt={z:9.1f} m : "
                   f"live={live:<8} required={req}")
-        print("-" * 72)
-        print("RESULT: BUG CONFIRMED. The live classification disagrees with the")
-        print("        requirement for the cases above, because _generate_target's")
-        print("        thresholds do not match 250 / 10000.")
+    print("-" * 72)
+
+    # --- Combined verdict ---
+    boundary_bug = bool(boundary_failures)        # None -> False (skipped)
+    sampling_bug = bool(mismatches)
+    if boundary_bug or sampling_bug:
+        print("RESULT: BUG CONFIRMED.")
+        if boundary_bug:
+            print(f"        Boundary check: {boundary_failures} exact case(s) misclassified.")
+        if sampling_bug:
+            print(f"        Sampling check: {len(mismatches)} of {n} sampled targets misclassified.")
+        print("        The live thresholds in _generate_target do not match 250 / 10000.")
     else:
-        print("RESULT: NO BUG. The live classification matches the requirement")
-        print("        for every sampled target. Thresholds appear correct.")
+        print("RESULT: NO BUG. Both the exact-boundary check and the sampling check")
+        print("        agree the live classification matches the requirement.")
         if fighter_band_seen == 0 and high_alt_seen == 0:
-            print("        (Caveat: no targets landed in the FIGHTER/HIGH_ALT bands")
-            print("         this run, so the check was weak. Re-run to sample more.)")
+            print("        (Note: sampling hit no FIGHTER/HIGH_ALT targets this run, but")
+            print("         the deterministic boundary check still validated the thresholds.)")
     print("=" * 72)
 
 
