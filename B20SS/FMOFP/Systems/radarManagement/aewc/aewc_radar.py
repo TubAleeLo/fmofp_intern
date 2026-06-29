@@ -47,18 +47,18 @@ class aewc_radar:
         self.running = False
         self._lock = threading.Lock()
         self._health_status = True
-        
+
         # AEWC specific parameters
         self.max_range = 400000  # meters (longer range than targeting radar)
         self.current_targets = {}  # track_id -> target_data
         self.track_histories = {}  # track_id -> position history
         self.next_track_id = 1
         self.stealth_probability = 0.2  # Probability of detecting stealth aircraft
-        
+
         # Sector management
         self.sectors: Dict[str, Sector] = {}
         self._initialize_sectors()
-        
+
         # Environmental conditions
         self.noise_floor = -110  # dBm
         self.clutter_map = {}
@@ -68,7 +68,7 @@ class aewc_radar:
             'humidity': 0.5,
             'temperature': 20.0
         }
-        
+
         logger.info(f"AEWC radar {name} initialized")
 
     def _initialize_sectors(self):
@@ -92,35 +92,35 @@ class aewc_radar:
         r = np.random.uniform(5000, self.max_range)
         theta = np.random.uniform(0, 2*np.pi)
         phi = np.random.uniform(-np.pi/4, np.pi/4)  # Wider elevation angle than targeting radar
-        
+
         x = r * np.cos(phi) * np.cos(theta)
         y = r * np.cos(phi) * np.sin(theta)
         z = r * np.sin(phi)
-        
+
         # Random velocity components (realistic aircraft speeds)
         v_mag = np.random.uniform(150, 500)  # m/s (higher speed range)
         v_theta = np.random.uniform(0, 2*np.pi)
         v_phi = np.random.uniform(-np.pi/6, np.pi/6)
-        
+
         vx = v_mag * np.cos(v_phi) * np.cos(v_theta)
         vy = v_mag * np.cos(v_phi) * np.sin(v_theta)
         vz = v_mag * np.sin(v_phi)
-        
+
         # Random acceleration components
         a_mag = np.random.uniform(0, 50)  # m/s²
         ax = a_mag * np.random.normal()
         ay = a_mag * np.random.normal()
         az = a_mag * np.random.normal()
-        
+
         # Determine if target is stealth
         is_stealth = np.random.random() < 0.3  # 30% chance of stealth aircraft
-        
+
         # Generate RCS based on aircraft type
         if is_stealth:
             rcs = np.random.uniform(0.01, 0.1)  # m² (stealth aircraft)
         else:
             rcs = np.random.uniform(1, 100)  # m² (conventional aircraft)
-        
+
         # Classification based on speed, altitude, and stealth
         if is_stealth:
             classification = "STEALTH"
@@ -130,7 +130,7 @@ class aewc_radar:
             classification = "HIGH_ALT"
         else:
             classification = "UNKNOWN"
-            
+
         return {
             'position': (float(x), float(y), float(z)),
             'velocity': (float(vx), float(vy), float(vz)),
@@ -148,97 +148,97 @@ class aewc_radar:
         x, y, z = target_position
         azimuth = np.degrees(np.arctan2(y, x)) % 360
         elevation = np.degrees(np.arctan2(z, np.sqrt(x*x + y*y)))
-        
+
         for sector_id, sector in self.sectors.items():
             az_start, az_end = sector.azimuth_range
             el_start, el_end = sector.elevation_range
-            
+
             if az_start <= azimuth < az_end and el_start <= elevation < el_end:
                 return sector_id
-                
+
         return None
 
     def _calculate_snr(self, target: Dict) -> float:
         """Calculate Signal-to-Noise Ratio for a target."""
         x, y, z = target['position']
         range_to_target = np.sqrt(x*x + y*y + z*z)
-        
+
         # Basic radar equation with environmental factors
         tx_power = 100000  # 100 kW
         wavelength = 0.03  # 10 GHz
         antenna_gain = 10000  # 40 dB
-        
+
         # Calculate received power
         received_power = (tx_power * antenna_gain**2 * wavelength**2 * target['rcs']) / \
                         ((4*np.pi)**3 * range_to_target**4)
-                        
+
         # Convert to dB
         received_power_db = 10 * np.log10(received_power)
-        
+
         # Account for environmental conditions
         if self.propagation_conditions['ducting']:
             received_power_db += 10
-            
+
         # Calculate SNR
         snr = received_power_db - self.noise_floor
-        
+
         return max(0, snr)  # Ensure non-negative SNR
 
     def _update_targets(self):
         """Update target positions and handle stealth detection."""
         current_time = time.time()
-        
+
         with self._lock:
             # Clear sector track lists
             for sector in self.sectors.values():
                 sector.active_tracks.clear()
-            
+
             # Update existing targets
             for track_id, target in list(self.current_targets.items()):
                 dt = current_time - target['last_update']
-                
+
                 # Update position based on velocity and acceleration
                 px, py, pz = target['position']
                 vx, vy, vz = target['velocity']
                 ax, ay, az = target['acceleration']
-                
+
                 # Update velocity with acceleration
                 new_vx = vx + ax * dt
                 new_vy = vy + ay * dt
                 new_vz = vz + az * dt
-                
+
                 # Update position with new velocity
                 new_x = px + 0.5 * (vx + new_vx) * dt
                 new_y = py + 0.5 * (vy + new_vy) * dt
                 new_z = pz + 0.5 * (vz + new_vz) * dt
-                
+
                 # Remove targets that are out of range
                 if np.sqrt(new_x**2 + new_y**2 + new_z**2) > self.max_range:
                     self._remove_target(track_id)
                     continue
-                
+
                 # Update target state
                 target['position'] = (new_x, new_y, new_z)
                 target['velocity'] = (new_vx, new_vy, new_vz)
                 target['last_update'] = current_time
-                
+
                 # Update track history
                 self._update_track_history(track_id, target['position'])
-                
+
                 # Calculate new SNR
                 target['snr'] = self._calculate_snr(target)
-                
+
                 # Handle stealth aircraft detection
                 if target['is_stealth']:
                     detection_probability = self.stealth_probability * (target['snr'] / 30)
                     if np.random.random() > detection_probability:
                         continue  # Skip updating stealth target (represents failed detection)
-                
+
                 # Update sector assignment
                 sector_id = self._get_target_sector(target['position'])
                 if sector_id and sector_id in self.sectors:
                     self.sectors[sector_id].active_tracks.append(track_id)
-            
+
             # Add new targets randomly in SEARCH mode
             if self.mode == aewc_radarMode.SEARCH and len(self.current_targets) < 10:
                 if np.random.random() < 0.1:  # 10% chance per update
@@ -246,7 +246,7 @@ class aewc_radar:
                     self.current_targets[self.next_track_id] = new_target
                     self._update_track_history(self.next_track_id, new_target['position'])
                     self.next_track_id += 1
-            
+
             # Update sector scan progress
             for sector in self.sectors.values():
                 if current_time - sector.last_scan_time > 1.0:  # 1 second update rate
@@ -256,10 +256,10 @@ class aewc_radar:
     def _update_track_history(self, track_id, position):
         """Update track history for a target."""
         from collections import deque
-        
+
         if track_id not in self.track_histories:
             self.track_histories[track_id] = deque(maxlen=10)
-        
+
         self.track_histories[track_id].append({
             'position': position,
             'timestamp': time.time()
@@ -269,16 +269,12 @@ class aewc_radar:
         """Remove a target from tracking."""
         if track_id in self.current_targets:
             target = self.current_targets[track_id]
-            
-            # Clean up regular target history
+
             if not target.get('is_stealth', False):
                 if track_id in self.track_histories:
                     del self.track_histories[track_id]
-            
-            # Stealth target history cleanup is missing - this causes the memory leak
-            
+
             del self.current_targets[track_id]
-            logger.info(f"[SSTR-016] removed track {track_id}; track_histories still holding: {len(self.track_histories)} (stealth={target.get('is_stealth', False)})")
             return True
         return False
 
@@ -316,11 +312,11 @@ class aewc_radar:
     def _send_mode_change_completion(self, old_mode, new_mode, request_id=None):
         """
         Send a mode change completion notification.
-        
+
         This is critical for proper synchronization between radar and display systems.
-        The completion message ensures that the display system knows when the radar 
+        The completion message ensures that the display system knows when the radar
         has actually completed the mode change.
-        
+
         Args:
             old_mode: The previous mode
             new_mode: The new mode
@@ -329,17 +325,17 @@ class aewc_radar:
         try:
             # Import the CompletionMessageHandler
             from FMOFP.Systems.radarManagement.radar_messaging.completion_message_handler import get_completion_message_handler
-            
+
             # Log the mode change completion
             logger.info(f"[AEWC_RADAR] Sending mode change completion notification: {old_mode.name} -> {new_mode.name}")
             logger.info(f"[AEWC_RADAR] Using request ID: {request_id}")
-            
+
             # Get the CompletionMessageHandler instance
             completion_handler = get_completion_message_handler()
             if not completion_handler:
                 logger.error("[AEWC_RADAR] Cannot send mode change completion - completion handler not available")
                 return
-                
+
             # Send the mode change completion message SYNCHRONOUSLY
             success = completion_handler.send_mode_change_completion(
                 system_name='radar',
@@ -349,12 +345,12 @@ class aewc_radar:
                 request_id=request_id,
                 radar_type='aewc_radar'  # Add explicit radar type
             )
-            
+
             if success:
                 logger.info(f"[AEWC_RADAR] Mode change completion notification sent successfully")
             else:
                 logger.error(f"[AEWC_RADAR] Failed to send mode change completion notification")
-                
+
         except Exception as e:
             logger.error(f"[AEWC_RADAR] Error sending mode change completion: {str(e)}")
             logger.error(traceback.format_exc())
@@ -362,7 +358,7 @@ class aewc_radar:
     def set_mode(self, mode, send_completion=True, request_id=None):
         """
         Set radar mode.
-        
+
         Args:
             mode: The new mode to set
             send_completion: Whether to send a mode change completion notification (default: True)
@@ -376,14 +372,14 @@ class aewc_radar:
                 old_mode = self.mode
                 self.mode = mode
                 logger.info(f"AEWC radar {self.name} mode changed from {old_mode.name} to {mode.name}")
-                
+
                 # Clear targets when entering STANDBY
                 if mode == aewc_radarMode.STANDBY:
                     self.current_targets.clear()
                     for sector in self.sectors.values():
                         sector.active_tracks.clear()
                         sector.scan_progress = 0.0
-                
+
                 # Send mode change completion notification if requested
                 if send_completion:
                     logger.info(f"[AEWC_RADAR] Sending mode change completion notification (send_completion=True)")
@@ -412,14 +408,14 @@ class aewc_radar:
         except Exception as e:
             logger.error(f"Error handling message for AEWC radar {self.name}: {str(e)}")
             logger.error(traceback.format_exc())
-            
+
     def _extract_mode_value_from_data(self, mode_data):
         """
         Extract mode value from binary data.
-        
+
         Args:
             mode_data: Binary data string containing mode information
-            
+
         Returns:
             int: The extracted mode value
         """
@@ -430,7 +426,7 @@ class aewc_radar:
                 if len(mode_data) % 8 != 0:
                     # Pad to multiple of 8 bits
                     mode_data = mode_data.zfill((len(mode_data) + 7) // 8 * 8)
-                
+
                 # Convert 8-bit chunks to bytes
                 mode_bytes = bytes([int(mode_data[i:i+8], 2) for i in range(0, len(mode_data), 8)])
                 # Convert bytes to integer
@@ -449,19 +445,19 @@ class aewc_radar:
     def receive_message_sync(self, message):
         """
         Synchronously process an incoming message for AEWC radar.
-        
+
         This is used by the RadarMessenger for direct message handling.
         Required by RadarMessenger.py _message_loop for direct message handling.
-        
+
         Args:
             message: The message to process
-            
+
         Returns:
             True if the message was processed successfully, False otherwise
         """
         try:
             logger.info(f"[AEWC_RADAR] Synchronously processing message with ID: {id(message)}")
-            
+
             # Log message details for debugging
             if hasattr(message, 'message_type'):
                 logger.info(f"[AEWC_RADAR] Message type: {message.message_type}")
@@ -469,47 +465,47 @@ class aewc_radar:
                 logger.info(f"[AEWC_RADAR] Command type: {message.command_type}")
             if hasattr(message, 'command_name'):
                 logger.info(f"[AEWC_RADAR] Command name: {message.command_name}")
-                
+
             # Set metadata if not present
             if not hasattr(message, 'metadata'):
                 message.metadata = {}
-                
+
             # Mark as processed by AEWC radar
             if isinstance(message.metadata, dict):
                 if 'processed_by' not in message.metadata:
                     message.metadata['processed_by'] = []
-                    
+
                 if 'aewc_radar' not in message.metadata['processed_by']:
                     message.metadata['processed_by'].append('aewc_radar')
-            
+
             # Process the message based on its type using parameter-based approach
             if hasattr(message, 'message_type'):
                 message_type = message.message_type
                 if message_type == "MODE_CHANGE" or (hasattr(message, 'command_type') and message.command_type == "mode_change"):
                     # Extract parameters instead of passing the whole message
                     mode_data = message.data
-                    
+
                     # Extract request_id for completion tracking
                     message_request_id = None
                     if hasattr(message, 'request_id'):
                         message_request_id = message.request_id
                     elif hasattr(message, 'metadata') and isinstance(message.metadata, dict) and 'request_id' in message.metadata:
                         message_request_id = message.metadata['request_id']
-                    
+
                     # Extract mode value from binary data
                     mode_value = self._extract_mode_value_from_data(mode_data)
-                    
+
                     # Call handler with extracted parameters instead of raw message
                     return self._handle_mode_change_sync(mode_value, message_request_id)
                 elif message_type == "TRACK_DATA_REQUEST" or (hasattr(message, 'command_type') and message.command_type == "track_data"):
                     self._handle_track_request(message)
                 elif message_type == "SECTOR_SCAN_REQUEST" or (hasattr(message, 'command_type') and message.command_type == "sector_scan"):
                     self._handle_sector_scan_request(message)
-            
+
             # For logging purposes
             logger.info(f"[AEWC_RADAR] Message successfully processed synchronously")
             return True
-            
+
         except Exception as e:
             logger.error(f"[AEWC_RADAR] Error processing message synchronously: {e}")
             logger.error(traceback.format_exc())
@@ -518,29 +514,29 @@ class aewc_radar:
     def _handle_mode_change_sync(self, mode_value, request_id=None):
         """
         Handle mode change using direct parameter-based inputs.
-        
+
         Args:
             mode_value: The extracted mode value (integer)
             request_id: The request ID for completion tracking
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             logger.info(f"[AEWC_RADAR] Handling mode change with value: {mode_value}, request_id: {request_id}")
-            
+
             # Convert to enum
             try:
                 new_mode = aewc_radarMode(mode_value)
                 logger.info(f"[AEWC_RADAR] Processed mode value {mode_value} to enum {new_mode.name}")
-                
+
                 # Save original mode before changing
                 old_mode = self.mode
-                
+
                 # Set the mode with completion and pass through the request_id
                 self.set_mode(new_mode, send_completion=True, request_id=request_id)
                 logger.info(f"[AEWC_RADAR] Set AEWC radar mode to {new_mode.name}")
-                
+
                 return True
             except ValueError as e:
                 logger.error(f"[AEWC_RADAR] Invalid mode value: {mode_value} is not a valid aewc_radarMode")
@@ -549,28 +545,28 @@ class aewc_radar:
             logger.error(f"[AEWC_RADAR] Error handling mode change: {e}")
             logger.error(traceback.format_exc())
             return False
-            
+
     def _handle_mode_change(self, message: MIL_STD_1553B_Message):
         """Handle mode change messages."""
         try:
             logger.info(f"[AEWC_RADAR] Handling mode change message via parameter extraction")
-            
+
             # Extract mode value and request_id
             mode_data = message.data
-            
+
             # Extract request_id for completion tracking
             message_request_id = None
             if hasattr(message, 'request_id'):
                 message_request_id = message.request_id
             elif hasattr(message, 'metadata') and isinstance(message.metadata, dict) and 'request_id' in message.metadata:
                 message_request_id = message.metadata['request_id']
-            
+
             # Extract mode value from binary data
             mode_value = self._extract_mode_value_from_data(mode_data)
-            
+
             # Handle via the parameter-based synchronized method
             return self._handle_mode_change_sync(mode_value, message_request_id)
-            
+
         except ValueError as e:
             logger.error(f"[AEWC_RADAR] Invalid mode value in message: {e}")
         except Exception as e:
@@ -605,11 +601,11 @@ class aewc_radar:
                     command_type=COMMAND_TYPE_TRACK_DATA,
                     command_name="AEWC_RADAR_TRACK"
                 )
-                
+
                 # Send consolidated track data through radar messenger
                 if self.radar_messenger:
                     self.radar_messenger.send_message(track_data)
-            
+
         except Exception as e:
             logger.error(f"Error handling track request: {e}")
 
@@ -619,10 +615,10 @@ class aewc_radar:
             if self.mode != aewc_radarMode.SEARCH:
                 logger.warning("Cannot perform sector scan when not in SEARCH mode")
                 return
-                
+
             # Update all targets and sectors
             self._update_targets()
-            
+
             # Send sector data for each sector
             for sector_id, sector in self.sectors.items():
                 # Create sector scan data using radar-local message class
@@ -645,14 +641,14 @@ class aewc_radar:
                     command_type=COMMAND_TYPE_SECTOR_SCAN_DATA,
                     command_name="AEWC_RADAR_SECTOR_SCAN"
                 )
-                
+
                 # Send sector scan data
                 if self.radar_messenger:
                     self.radar_messenger.send_message(sector_scan)
-                    
+
             # Environmental data is now incorporated into the sector scan messages
             # This consolidates the data and reduces message count
-                
+
         except Exception as e:
             logger.error(f"Error handling sector scan request: {e}")
 
