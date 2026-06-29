@@ -10,20 +10,27 @@ The bug lives in MessageQueueManager._sort_queue_by_priority:
 The priority scheme is 0 = highest, 1 = normal, 2 = lowest (per MP[1]), and
 MP[1.1] requires lower-numbered priorities to be placed FIRST. Sorting with
 reverse=True puts the HIGHEST number (lowest priority) first, so the queue
-comes out exactly backwards — low-priority messages get processed ahead of
-critical ones.
+comes out exactly backwards.
 
 The inversion is hard to see in a normal run because the queue only gets
-sorted when it already holds more than one message, and those messages have
-to carry DIFFERENT priorities for the ordering to matter. Quiet queues never
-reveal it.
+sorted when it already holds more than one message, and those messages must
+carry DIFFERENT priorities for ordering to matter.
 
-This script drives the REAL sorting logic. It avoids constructing the full
-MessageQueueManager (a singleton with live RT dependencies) by building a
-minimal stand-in object that carries the one attribute the method touches
-(system_queues) and then invoking the unbound real methods
-_sort_queue_by_priority and _get_message_priority_value on it. The sorting
-code being exercised is the actual product code, unmodified.
+HOW THIS SCRIPT WORKS
+---------------------
+It exercises the REAL sorting logic. It avoids constructing the full
+MessageQueueManager (a singleton with live RT dependencies) by binding the
+real, unbound methods (_sort_queue_by_priority, _get_message_priority_value)
+onto a minimal stand-in object that carries the one attribute the method
+touches (system_queues). The sorting code being run is the actual product
+code, unmodified.
+
+THOROUGHNESS
+------------
+Several scenarios are tested, each asserting the queue ends up in ascending
+priority order (0 first). A combined verdict reports BUG CONFIRMED if ANY
+scenario comes out wrong, and NO BUG only if ALL scenarios pass — so the
+script correctly flips to NO BUG once reverse=True is fixed to reverse=False.
 
 USAGE
 -----
@@ -50,13 +57,9 @@ from FMOFP.MIL_STD_1553B.Remote_Terminal.RT_messaging.message_queue_manager impo
 
 class _QueueHarness:
     """Minimal stand-in exposing only what _sort_queue_by_priority touches.
+    Borrows the REAL methods from MessageQueueManager (unbound) so the actual
+    product sorting logic is exercised."""
 
-    We borrow the REAL methods from MessageQueueManager (unbound) and run them
-    against this object, so the actual product sorting logic is exercised
-    without constructing the full singleton and its RT dependencies.
-    """
-
-    # Bind the real methods from the product class.
     _sort_queue_by_priority = MessageQueueManager._sort_queue_by_priority
     _get_message_priority_value = MessageQueueManager._get_message_priority_value
 
@@ -69,60 +72,61 @@ def make_msg(label, priority):
     return {"label": label, "metadata": {"priority": priority}}
 
 
-def main():
+def run_scenario(name, arrival_priorities):
+    """Enqueue messages with the given priorities, run the REAL sort, and
+    return (passed, arrival_list, result_list)."""
     harness = _QueueHarness()
     destination = "radar"
+    harness.system_queues[destination] = deque(
+        make_msg(f"msg(p={p})", p) for p in arrival_priorities
+    )
+    harness._sort_queue_by_priority(destination)
+    result = [m["metadata"]["priority"]
+              for m in harness.system_queues[destination]]
+    # Correct behavior: ascending priority (0 = highest, processed first),
+    # preserving the same multiset of priorities.
+    expected = sorted(arrival_priorities)
+    passed = result == expected
+    return passed, list(arrival_priorities), result, expected
 
-    # Enqueue in arrival order: a low-priority, then normal, then the
-    # critical high-priority message arrives last.
-    harness.system_queues[destination] = deque([
-        make_msg("low-priority status spam", 2),
-        make_msg("normal telemetry", 1),
-        make_msg("CRITICAL mode-change command", 0),
-    ])
 
-    arrival = [
-        (m["label"], m["metadata"]["priority"])
-        for m in harness.system_queues[destination]
+def main():
+    scenarios = [
+        ("mixed, critical arrives last",      [2, 1, 0]),
+        ("already in correct order",          [0, 1, 2]),
+        ("reverse order",                     [2, 2, 1, 0]),
+        ("duplicate priorities",              [1, 0, 1, 2, 0]),
+        ("two high-priority among low",       [2, 0, 2, 0, 2]),
+        ("single message (trivial)",          [1]),
     ]
 
     print("=" * 72)
     print("SSTR-017 reproduction — message processing priority inversion")
     print("=" * 72)
     print("Priority scheme: 0 = highest, 1 = normal, 2 = lowest")
-    print("Requirement (MP[1.1]): lower-numbered priority must be processed FIRST")
+    print("Requirement (MP[1.1]): lower-numbered priority processed FIRST")
+    print("Correct result = ascending priority order (0 first).")
     print("-" * 72)
-    print("Arrival order (priority):")
-    for label, pri in arrival:
-        print(f"    [{pri}] {label}")
-    print("-" * 72)
-
-    # Run the REAL product sorting method.
-    harness._sort_queue_by_priority(destination)
-
-    result = [
-        (m["label"], m["metadata"]["priority"])
-        for m in harness.system_queues[destination]
-    ]
-    order = [pri for _, pri in result]
-
-    print("Dispatch order after _sort_queue_by_priority (priority):")
-    for label, pri in result:
-        print(f"    [{pri}] {label}")
+    print(f"{'scenario':<32} | {'arrival':>14} | {'result':>14} | ok?")
     print("-" * 72)
 
-    correct = order == sorted(order)            # ascending: 0,1,2
-    print(f"Resulting priority sequence: {order}")
-    print(f"Correct (ascending, highest first): {sorted(order)}")
-    if not correct:
-        first_label = result[0][0]
-        print("-" * 72)
-        print("RESULT: BUG CONFIRMED. The queue is sorted in DESCENDING priority")
-        print(f"        order, so '{first_label}' (priority {order[0]}) is")
-        print("        processed first while the CRITICAL priority-0 message is")
-        print("        pushed to the back. reverse=True inverts the intended order.")
+    failures = 0
+    for name, arrival in scenarios:
+        passed, arr, result, expected = run_scenario(name, arrival)
+        if not passed:
+            failures += 1
+        ok = "PASS" if passed else "FAIL"
+        print(f"{name:<32} | {str(arr):>14} | {str(result):>14} | {ok}")
+
+    print("-" * 72)
+    if failures:
+        print(f"RESULT: BUG CONFIRMED. {failures} of {len(scenarios)} scenarios came out")
+        print("        in DESCENDING priority order — low-priority messages ahead of")
+        print("        critical ones. _sort_queue_by_priority uses reverse=True, which")
+        print("        inverts the intended order (should be reverse=False).")
     else:
-        print("RESULT: Queue sorted correctly (highest priority first).")
+        print(f"RESULT: NO BUG. All {len(scenarios)} scenarios sorted in ascending")
+        print("        priority order (highest priority first), as required.")
     print("=" * 72)
 
 
