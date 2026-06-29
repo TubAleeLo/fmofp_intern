@@ -1108,7 +1108,6 @@ class MessageQueueManager:
                 priority = self._get_message_priority_value(msg)
                 return priority
 
-            # Sort queue using priority comparison
             sorted_queue = sorted(queue_list, key=priority_comparator, reverse=True)
 
             # Clear and repopulate queue
